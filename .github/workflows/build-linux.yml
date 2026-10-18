@@ -1,0 +1,103 @@
+# Linux-only CPU build for personal use.
+#
+# The upstream release.yml can't be reused as-is: it fans out across macOS and
+# Windows and requires Apple signing + TAURI_SIGNING_PRIVATE_KEY secrets that
+# only exist upstream. This workflow builds the CPU sidecar and the desktop app
+# for ubuntu-latest and uploads them as artifacts, no signing required.
+name: build-linux
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      # The upstream release job reclaims ~20 GB before building. A PyInstaller
+      # onefile plus a Tauri release build needs more than the default image
+      # leaves free on /.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          # large-packages: true would `apt-get remove '^llvm-.*'`, which
+          # cascade-removes reverse deps that the llvm-dev install below needs.
+          large-packages: false
+          swap-storage: true
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev \
+            patchelf llvm-dev libasound2-dev build-essential ffmpeg
+
+      - name: Install just
+        uses: taiki-e/install-action@just
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Must come BEFORE `just setup-python`. backend/requirements.txt only
+      # pins `torch>=2.5.0`, so pip resolves it from PyPI, where the default
+      # wheels are the CUDA builds — that pulls ~3 GB of nvidia_* packages that
+      # then fail to download and fail the job. Pre-installing the CPU wheels
+      # satisfies the pin, so requirements.txt leaves torch alone.
+      - name: Install CPU-only PyTorch
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install Python dependencies
+        run: just setup-python
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install JavaScript dependencies
+        run: bun install
+
+      - name: Build Python server (sidecars)
+        run: |
+          chmod +x scripts/build-server.sh
+          ./scripts/build-server.sh
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./tauri/src-tauri -> target"
+
+      # beforeBuildCommand in tauri.conf.json runs `bun run build` (vite), so
+      # the frontend is compiled as part of this step.
+      - name: Build Tauri desktop app
+        run: |
+          cd tauri
+          bun run tauri build --bundles deb,appimage
+
+      - name: Upload sidecars
+        uses: actions/upload-artifact@v4
+        with:
+          name: sidecars
+          path: |
+            tauri/src-tauri/binaries/voicebox-server-x86_64-unknown-linux-gnu
+            tauri/src-tauri/binaries/voicebox-mcp-x86_64-unknown-linux-gnu
+          retention-days: 7
+
+      - name: Upload desktop app
+        uses: actions/upload-artifact@v4
+        with:
+          name: voicebox-linux-app
+          path: |
+            tauri/src-tauri/target/release/bundle/deb/*.deb
+            tauri/src-tauri/target/release/bundle/appimage/*.AppImage
+          retention-days: 7
+          if-no-files-found: error
